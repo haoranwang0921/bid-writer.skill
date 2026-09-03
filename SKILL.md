@@ -1,7 +1,7 @@
 ---
 name: bid-writer
-description: 模板截取式投标文件撰写。触发场景：写标书、编制投标文件/响应文件、按招标文件格式模板填空撰写。核心约束：(1)模板必须从招标文件 docx 截取（extract_template.py 起止标题定位+原样切片，继承原始格式/表格/占位符，禁止凭空生成模板，起止或必备件定位失败必须先向用户确认）；(2)填空按置信度分级（fill_plan.py scan→提问→apply→fill_docx 就地写回），高置信度直接填入，低置信度列 2-4 候选项+依据向用户确认后再写入，不得臆测；(3)交付前跑机检（verify.py：占位残留/金额一致/结构保真/红线），红线数据由 parse_tender.py 从招标文件提取；(4)叙述章节由 write_narrative.py 检索本地知识库生成素材并写入草稿（数字/参数须溯源）；(5)以既有参考输出为基准做逐节 diff 回归（diff_report.py），输出差异清单与通过率统计。区别于 bid-studio（全流程含决策/评分范式挂载），本 skill 专注「模板驱动撰写+量化回归」。
-version: 0.3.0
+description: 模板截取式投标文件撰写。触发场景：写标书、编制投标文件/响应文件、按招标文件格式模板填空撰写。核心约束：(1)模板必须从招标文件 docx 截取（extract_template.py 起止标题定位+原样切片，继承原始格式/表格/占位符，禁止凭空生成模板，起止或必备件定位失败必须先向用户确认）；(2)填空按置信度分级（fill_plan.py scan→提问→apply→fill_docx 就地写回），high=画像键名与槽 label 归一化后精确一致且唯一值→auto；medium/fuzzy→ask 列 2-4 候选项+依据向用户确认后再写入，**子串命中（如「名称」键 vs「项目名称」槽）不得判 high 防串值**；low→ask（禁止臆测）；(3)交付前跑机检（verify.py：占位残留/金额一致/结构保真/红线，红线按行判定+目录短行不算实质响应），缺失 --quotes/--template/--tender-parse 时对应轨道记 SKIP 显式披露，FAIL（exit 5）禁止交付；(4)叙述章节由 write_narrative.py 检索本地知识库生成素材并写入草稿（数字/参数须溯源）；(5)证照图片由 insert_images.py 从成交响应文件抽图按小节插入（标题锚点后居中图 6in）；(6)以既有参考输出为基准做逐节 diff 回归（diff_report.py），输出差异清单与通过率统计。区别于 bid-studio（全流程含决策/评分范式挂载），本 skill 专注「模板驱动撰写+量化回归」。
+version: 0.3.1
 agent_created: true
 metadata:
   compatible_agents: [workbuddy]
@@ -28,7 +28,7 @@ metadata:
 - `references/diff-interface.md` — 环节四 diff 算法与报告格式
 - `references/redline-checklist.md` — 按采购类型的必备模板/要件清单
 
-Python 依赖 `python-docx`。Windows 下脚本一律以**绝对路径**调用（bash 中 `~` 与相对路径会被错误解析）。
+Python 依赖 `python-docx`；测试需 `pytest`。Windows 下脚本一律以**绝对路径**调用（bash 中 `~` 与相对路径会被错误解析）。
 
 ## 环节一：模板截取（先取模板，后动笔）
 
@@ -54,8 +54,8 @@ python scripts/extract_template.py <招标文件.docx> -o template.docx -m templ
 
 | 置信度 | 判定 | 动作 |
 |---|---|---|
-| high | 已确认资料（招标文件常量、企业画像、既往确认）唯一命中 | 直接填入，不问 |
-| medium | 2–4 个候选值 / 口径歧义（含税与否、报价口径、联合体与否） | **列出候选项+依据向用户确认后才写入** |
+| high | 画像键名与槽 label 归一化后【精确一致】且值唯一（含编号前缀如「（九）工期」）→ auto | 直接填入，不问 |
+| medium | 精确键多值冲突 / 仅子串（模糊）命中（如画像「名称」键 vs 槽「项目名称」） | **列出候选项+依据向用户确认后才写入**（子串命中不得降级 high，防串值） |
 | low | 无任何来源 | **必须提问**（含"自行填写"选项），禁止臆测 |
 
 ```bash
@@ -120,7 +120,16 @@ python scripts/verify.py 投标文件.docx --template template.json \
     --quotes quotes.json --tender-parse tender.json -o verify_report.md
 ```
 
-A 占位残留=0；B 分项合计=总价、大小写互核（修饰语「约/左右」拒收）；C 模板节不得被删除；D 废标条款逐条找响应证据（`--tender-parse` 用 parse_tender.py 的 `disqualification_clauses`）。退出码 5 = FAIL，修复重跑。
+四轨道（缺参 → SKIP 显式披露，stderr 提示补齐，不静默绿灯）：
+
+| 轨道 | 需参数 | 判定 |
+|---|---|---|
+| A 占位残留 | 无 | `【待填/待确认/待补】` + 未填原始模板占位（含下划线/冒号空白槽/非豁免【】），豁免表见 `_common.EXEMPT_PH` |
+| B 金额一致 | `--quotes` | 分项合计=总价 + 大小写互核（`cn_to_num`），`parse_amount` 拒收约/左右/不含税等修饰语 |
+| C 结构保真 | `--template` | 草稿须覆盖 template.json headings（禁止删模板节） |
+| D 红线扫描 | `--tender-parse` | 按行判定：红线短语仅出现在目录/标题式短行（行长 < 短语+8）**不算实质响应**；全部短行命中记 WEAK |
+
+退出码 0 通过（含 WEAK/SKIP）；5 存在 FAIL，修复重跑。
 
 ## 环节四：diff 回归测试（验收标尺）
 
@@ -191,3 +200,8 @@ python scripts/diff_report.py <参考基准.docx|json> <新结果.docx|json> \
 ## 企业画像
 
 画像 JSON（schema 见 `references/confidence-protocol.md` 附录）保存在项目工作区，**skill 内不存放任何真实企业数据**，运行时经 `fill_plan.py scan --sources` 注入。
+
+## Changelog
+
+- v0.3.1 (2026-09-04)：质量加固。P1：fill_plan 置信度判定改为「精确键命中才 high」，子串命中（防「名称→项目名称」类串值）一律降 medium；verify.py 缺 `--quotes/--template/--tender-parse` 改 SKIP 显式披露（不静默绿灯），D 红线按行判定+目录短行不算实质响应；补全 scripts/insert_images.py（标题锚点后居中图 6in + PermissionError 另存 `_含图版.docx`）。P2：`_common.norm` 全角冒号统一（曾导致 label 不可比）；`cn_to_num` 修「壹佰贰拾叁元肆角伍分」被吞 0.45 元 bug；`parse_amount` 改先剥币种再判模糊修饰语；共享 `EXEMPT_PH`/`is_exempt_ph` 取代硬编码白名单。新增 tests/（pytest 33 个用例 + smoke_test/smoke_verify 端到端冒烟）。
+- v0.3.0 (2026-09-01)：四环节流水线定型；淄博项目实战踩坑记录；知识库直填 / 图片插入流程沉淀

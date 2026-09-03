@@ -36,7 +36,7 @@ def guard_out(path):
 def norm(text):
     """diff 用归一化：去空白、统一全半角标点、去格式噪声。"""
     t = re.sub(r"\s+", "", text or "")
-    table = str.maketrans("（）：；，．＿×", "()：;,._x")
+    table = str.maketrans("（）：；，．＿×", "():;,._x")
     return t.translate(table)
 
 
@@ -58,9 +58,18 @@ def cn_to_num(cn):
     else:
         tail = parts[0]
     tail = re.sub(r"^圆|^元", "", tail)
-    num = 0
-    yuan_part = re.split(r"角|分", tail)[0]
-    yuan_part = re.sub(r"元$", "", yuan_part)
+    # 整元段：取到首个「角/分」前的「元」为止（角数值在角字前，须排除）
+    jiao_pos, fen_pos = tail.find("角"), tail.find("分")
+    jf = [x for x in (jiao_pos, fen_pos) if x >= 0]
+    frac_start = min(jf) if jf else len(tail)
+    yuan_seg = tail[:frac_start]
+    y_pos = yuan_seg.find("元")
+    if y_pos >= 0:
+        yuan_part = yuan_seg[:y_pos]
+    elif jf:
+        yuan_part = ""  # 不足 1 元（如「伍角」「肆角伍分」）
+    else:
+        yuan_part = yuan_seg  # 无角分且无「元」字样的兜底
     cur, pending = 0, 0
     for ch in yuan_part:
         if ch in CN_DIG:
@@ -69,11 +78,7 @@ def cn_to_num(cn):
             cur += (pending or 1) * CN_UNIT[ch]
             pending = 0
     cur += pending
-    if re.search(r"[零壹贰叁肆伍陆柒捌玖]元", tail):
-        num = cur
-    else:
-        num = cur
-    total += num
+    total += cur
     jiao = re.search(r"([零壹贰叁肆伍陆柒捌玖])角", tail)
     fen = re.search(r"([零壹贰叁肆伍陆柒捌玖])分", tail)
     if jiao:
@@ -99,10 +104,10 @@ def parse_amount(txt):
     if txt is None:
         return None
     s = str(txt).strip()
-    if re.search(r"约|左右|大约|预计|不低于|不低于|含税|不含税|人民币|¥|￥|元", s):
-        s = re.sub(r"人民币|¥|￥|元|（[^）]*）|\([^)]*\)", "", s)
-        if re.search(r"约|左右|大约|预计|不低于", s):
-            return None
+    # 先剥离币种/括号注记，再判定模糊修饰语（约/左右/不低于等一律拒收）
+    s = re.sub(r"人民币|¥|￥|元|（[^）]*）|\([^)]*\)", "", s)
+    if re.search(r"约|左右|大约|预计|不低于|含税|不含税", s):
+        return None
     s = s.replace(",", "").replace("，", "")
     try:
         v = float(s)
@@ -114,6 +119,16 @@ def parse_amount(txt):
 PLACEHOLDER_RE = re.compile(r"_{2,}|＿{2,}|×{3,}|【[^】]{0,30}】|（\s*）")
 # 原始模板占位（与 fill_plan 槽位口径一致）：下划线/×××/【】/（ ）/冒号空白槽
 RAW_PH_RE = re.compile(r"_{2,}|＿{2,}|×{3,}|【[^】]{0,20}】|（\s*）|\(\s*\)|[：:][ \t\u3000]{2,}(?=[（(年元天日%]|$)")
+
+# 模板原生格式标题豁免：招标文件原样切片中的格式词（如「投标函【工程量清单计价】」），
+# 非可填占位。fill_plan 扫描与 verify 残留检查共用同一口径；新项目遇新格式词在此追加。
+EXEMPT_PH = {"工程量清单计价"}
+
+
+def is_exempt_ph(group):
+    """PH_RE 命中的【…】是否为模板格式标题（豁免，不算可填占位/残留）。"""
+    m = re.fullmatch(r"【([^】]+)】", group)
+    return bool(m and m.group(1) in EXEMPT_PH)
 
 
 def iter_sections(content):

@@ -123,7 +123,7 @@ def main():
     global PATTERN_ANY
     ap = argparse.ArgumentParser()
     ap.add_argument("draft", help="投标草稿 docx（fill_docx 产物）")
-    ap.add_argument("template_json", help="template_v2.json（提取元数据）")
+    ap.add_argument("template_json", help="template.json（提取元数据）")
     ap.add_argument("--out", default=None, help="输出草稿（默认 输入_叙述版.docx）")
     ap.add_argument("--patterns", default="", help="自拟叙述小节关键词（逗号分隔）")
     ap.add_argument("--service", default="http://127.0.0.1:8765")
