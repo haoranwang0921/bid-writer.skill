@@ -1,7 +1,7 @@
 ---
 name: bid-writer
-description: 模板截取式投标文件撰写。触发场景：写标书、编制投标文件/响应文件、按招标文件格式模板填空撰写。核心约束：(1)模板必须从招标文件 docx 截取（extract_template.py 起止标题定位+原样切片，继承原始格式/表格/占位符，禁止凭空生成模板，起止或必备件定位失败必须先向用户确认）；(2)填空按置信度分级（fill_plan.py scan→提问→apply→fill_docx 就地写回），high=画像键名与槽 label 归一化后精确一致且唯一值→auto；medium/fuzzy→ask 列 2-4 候选项+依据向用户确认后再写入，**子串命中（如「名称」键 vs「项目名称」槽）不得判 high 防串值**；low→ask（禁止臆测）；(3)交付前跑机检（verify.py：占位残留/金额一致/结构保真/红线，红线按行判定+目录短行不算实质响应），缺失 --quotes/--template/--tender-parse 时对应轨道记 SKIP 显式披露，FAIL（exit 5）禁止交付；(4)叙述章节由 write_narrative.py 检索本地知识库生成素材并写入草稿（数字/参数须溯源）；(5)证照图片由 insert_images.py 从成交响应文件抽图按小节插入（标题锚点后居中图 6in）；(6)以既有参考输出为基准做逐节 diff 回归（diff_report.py），输出差异清单与通过率统计。区别于 bid-studio（全流程含决策/评分范式挂载），本 skill 专注「模板驱动撰写+量化回归」。
-version: 0.3.1
+description: 模板截取式投标文件撰写。触发场景：写标书、编制投标文件/响应文件、按招标文件格式模板填空撰写。核心约束：(1)模板必须从招标文件 docx 截取（extract_template.py 起止标题定位+原样切片，继承原始格式/表格/占位符，禁止凭空生成模板，起止或必备件定位失败必须先向用户确认）；(2)填空按置信度分级（fill_plan.py scan→提问→apply→fill_docx 就地写回），high=画像键名与槽 label 归一化后精确一致且唯一值→auto；medium/fuzzy→ask 列 2-4 候选项+依据向用户确认后再写入，**子串命中（如「名称」键 vs「项目名称」槽）不得判 high 防串值**；low→ask（禁止臆测）；**填入文字必须继承占位 run 的 rPr（下划线/字号/字体/底纹），跨 run 时构造带源 rPr 的新 run，保留原占位 run 长度，不重建文档**；(3)交付前跑机检（verify.py：占位残留/金额一致/结构保真/红线，红线按行判定+目录短行不算实质响应），缺失 --quotes/--template/--tender-parse 时对应轨道记 SKIP 显式披露，FAIL（exit 5）禁止交付；(4)叙述章节由 write_narrative.py 检索本地知识库生成素材并写入草稿（数字/参数须溯源）；(5)证照图片由 insert_images.py 从成交响应文件抽图按小节插入（标题锚点后居中图 6in）；(6)以既有参考输出为基准做逐节 diff 回归（diff_report.py），输出差异清单与通过率统计。区别于 bid-studio（全流程含决策/评分范式挂载），本 skill 专注「模板驱动撰写+量化回归」。
+version: 0.3.2
 agent_created: true
 metadata:
   compatible_agents: [workbuddy]
@@ -203,5 +203,6 @@ python scripts/diff_report.py <参考基准.docx|json> <新结果.docx|json> \
 
 ## Changelog
 
+- v0.3.2 (2026-09-04)：下划线格式保真。`fill_docx._replace_in_para` 跨 run 路径不再粗暴置空旧 run 重建段落，改为把填入文字放在首 run（保留 rPr）+ post 段追加到新 run（同样带源 rPr）+ 其余占位 run 仅清空文字。彻底解决「填完下划线消失」「天」字重复/丢失等 review 痛点。新增 tests/test_underline.py 5 个用例（单 run / 跨 run 中段 / 跨 run 末段 / 文本长度不变 / 未命中返回 False）。pytest 38 passed。
 - v0.3.1 (2026-09-04)：质量加固。P1：fill_plan 置信度判定改为「精确键命中才 high」，子串命中（防「名称→项目名称」类串值）一律降 medium；verify.py 缺 `--quotes/--template/--tender-parse` 改 SKIP 显式披露（不静默绿灯），D 红线按行判定+目录短行不算实质响应；补全 scripts/insert_images.py（标题锚点后居中图 6in + PermissionError 另存 `_含图版.docx`）。P2：`_common.norm` 全角冒号统一（曾导致 label 不可比）；`cn_to_num` 修「壹佰贰拾叁元肆角伍分」被吞 0.45 元 bug；`parse_amount` 改先剥币种再判模糊修饰语；共享 `EXEMPT_PH`/`is_exempt_ph` 取代硬编码白名单。新增 tests/（pytest 33 个用例 + smoke_test/smoke_verify 端到端冒烟）。
 - v0.3.0 (2026-09-01)：四环节流水线定型；淄博项目实战踩坑记录；知识库直填 / 图片插入流程沉淀

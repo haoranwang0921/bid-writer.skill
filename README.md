@@ -47,7 +47,7 @@ bid-writer/
     ├── parse_tender.py            # 节点 0：招标结构解析
     ├── extract_template.py        # 环节一：起止定位 + 原样切片
     ├── fill_plan.py               # 环节二：槽位扫描 + 置信度分级 + 提问单（精确键=high，子串=medium）
-    ├── fill_docx.py               # 环节二：fills 就地写回切片副本
+    ├── fill_docx.py               # 环节二：fills 就地写回切片副本（保 rPr 下划线/字号/字体，跨 run 安全）
     ├── write_narrative.py         # 环节二续：叙述章节撰写（KB 检索 → 草稿）
     ├── insert_images.py           # 环节二附：从成交响应文件抽图按小节插入（标题锚点后居中图 6in）
     ├── verify.py                  # 环节三：交付机检（四轨道，缺参→SKIP 显式披露）
@@ -120,6 +120,7 @@ Windows 下脚本一律以**绝对路径**调用（bash 中 `~` 与相对路径�
 
 ## 版本
 
+- v0.3.2（2026-09-04）：下划线格式保真。fill_docx 跨 run 替换不再清空旧 run 重建，改为填入文字落在首 run（保留 rPr）+ post 段追加带源 rPr 新 run；新增 test_underline.py 5 用例
 - v0.3.1（2026-09-04）：质量加固。fill_plan 精确键=high、子串降 medium；verify SKIP 披露 + D 红线短行判定；补 insert_images.py；_common.norm/cn_to_num/parse_amount bugfix；tests/ 33 用例 + 冒烟
 - v0.3.0（2026-09-01）：四环节流水线定型；淄博项目实战踩坑记录；知识库直填 / 图片插入流程沉淀
 - 首版发布于 2026-09-03
