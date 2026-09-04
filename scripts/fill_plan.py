@@ -5,13 +5,15 @@
 CLI:
   python fill_plan.py scan <template.docx> [--sources a.json,b.json] \
       -o fill_plan.json [--questions questions.json]
-  python fill_plan.py apply <template.docx> <fill_plan.json> [--answers answers.json] -o fills.json
+  python fill_plan.py apply <template.docx> <fill_plan.json> \
+      [--smart smart_fill.json] [--answers answers.json] -o fills.json
 
 置信度：
   high=画像键名与槽位 label 归一化后【精确一致】（扁平键末段或整键）且值唯一 → auto；
   medium=精确键多值冲突 / 仅子串（模糊）命中 → ask（语义复核，防串值）；
   low=无任何来源 → ask（禁止臆测）。
-fills.json：{"fills": {"P12#0": "值", "T3:R1C2": "值"}}（仅 high/已确认槽位）。
+fills.json：{"fills": {"P12#0": "值", "T3:R1C2": "值"}}，并记录每个值来自
+deterministic_auto / model_evidence / human_answer。优先级：人工 > 已验证模型 > 机械 high。
 """
 import argparse, json, re, sys, os
 from datetime import datetime
@@ -150,8 +152,14 @@ def cmd_scan(a):
     stats = {"total": len(slots), "high": 0, "medium": 0, "low": 0}
     for s in slots:
         stats[s["confidence"]] += 1
+    source_catalog = [
+        {"id": f"json-{i + 1}", "kind": "json", "location": os.path.abspath(path),
+         "source_type": "structured", "access": "read_only"}
+        for i, path in enumerate(sources)
+    ]
     atomic_write_json(guard_out(a.out), {"meta": {"template": a.template,
-                     "generated_at": datetime.now().isoformat(timespec="seconds"), "stats": stats},
+                     "generated_at": datetime.now().isoformat(timespec="seconds"), "stats": stats,
+                     "source_catalog": source_catalog},
                      "slots": slots})
     if a.questions:
         qs = [{"id": s["id"], "label": s["label"], "current": s["current"],
@@ -166,6 +174,35 @@ def cmd_scan(a):
           f"low={stats['low']} 待确认={asks} -> {a.out}")
 
 
+def load_validated_smart(path):
+    """读取 smart_fill.validate 产物，并再次核对 auto_fills 与决策审计一致。"""
+    if not path:
+        return {}, {}
+    data = json.load(open(path, encoding="utf-8"))
+    meta = data.get("meta", {})
+    if meta.get("protocol") != "bid-writer-smart-fill/v1" or meta.get("validated") is not True:
+        raise ValueError("--smart 不是经 smart_fill.py validate 生成的受控决策文件")
+    decisions = {d.get("slot_id"): d for d in data.get("decisions", [])
+                 if isinstance(d, dict) and d.get("slot_id")}
+    auto, audit = {}, {}
+    for sid, value in data.get("auto_fills", {}).items():
+        d = decisions.get(sid, {})
+        check = d.get("validation", {})
+        if (check.get("auto_eligible") is not True
+                or d.get("effective_confidence") != "high"
+                or str(d.get("selected_value", "")) != str(value)):
+            raise ValueError(f"--smart 槽位 {sid} 的 auto_fills 与验证记录不一致")
+        auto[sid] = str(value)
+        audit[sid] = {
+            "origin": "model_evidence",
+            "canonical_field": d.get("canonical_field", ""),
+            "query": d.get("query", ""),
+            "reason": d.get("reason", ""),
+            "evidence": d.get("evidence", []),
+        }
+    return auto, audit
+
+
 def cmd_apply(a):
     doc = Document(a.template)
     plan = json.load(open(a.plan, encoding="utf-8"))
@@ -173,15 +210,30 @@ def cmd_apply(a):
     if a.answers:
         raw = json.load(open(a.answers, encoding="utf-8"))
         answers = raw.get("answers", raw)
-    fills, unconf = {}, 0
+    smart_fills, smart_audit = load_validated_smart(a.smart)
+    known_ids = {s["id"] for s in plan["slots"]}
+    unknown_smart = sorted(set(smart_fills) - known_ids)
+    if unknown_smart:
+        raise ValueError(f"--smart 含未知槽位：{','.join(unknown_smart)}")
+    fills, audit, unconf, unconfirmed_ids = {}, {}, 0, []
     for s in plan["slots"]:
         if s["id"] in answers:
             fills[s["id"]] = str(answers[s["id"]])
+            audit[s["id"]] = {"origin": "human_answer"}
+        elif s["id"] in smart_fills:
+            fills[s["id"]] = smart_fills[s["id"]]
+            audit[s["id"]] = smart_audit[s["id"]]
         elif s["status"] == "auto":
             fills[s["id"]] = s["candidates"][0]["value"]
+            audit[s["id"]] = {
+                "origin": "deterministic_auto",
+                "evidence": s.get("candidates", [])[:1],
+            }
         else:
             unconf += 1
-    atomic_write_json(guard_out(a.out), {"fills": fills, "unconfirmed": unconf,
+            unconfirmed_ids.append(s["id"])
+    atomic_write_json(guard_out(a.out), {"fills": fills, "audit": audit,
+                     "unconfirmed": unconf, "unconfirmed_ids": unconfirmed_ids,
                      "generated_at": datetime.now().isoformat(timespec="seconds")})
     print(f"OK fills={len(fills)} 未确认={unconf} -> {a.out}")
     if unconf:
@@ -200,6 +252,7 @@ def main():
     s2 = sub.add_parser("apply")
     s2.add_argument("template")
     s2.add_argument("plan")
+    s2.add_argument("--smart", default="", help="smart_fill.py validate 产物")
     s2.add_argument("--answers", default="")
     s2.add_argument("-o", "--out", default="fills.json")
     s2.set_defaults(fn=cmd_apply)

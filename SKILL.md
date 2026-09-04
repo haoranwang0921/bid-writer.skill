@@ -1,9 +1,9 @@
 ---
 name: bid-writer
-description: 模板截取式投标文件撰写。触发场景：写标书、编制投标文件/响应文件、按招标文件格式模板填空撰写。核心约束：(1)模板必须从招标文件 docx 截取（extract_template.py 起止标题定位+原样切片，继承原始格式/表格/占位符，禁止凭空生成模板，起止或必备件定位失败必须先向用户确认）；(2)填空按置信度分级（fill_plan.py scan→提问→apply→fill_docx 就地写回），high=画像键名与槽 label 归一化后精确一致且唯一值→auto；medium/fuzzy→ask 列 2-4 候选项+依据向用户确认后再写入，**子串命中（如「名称」键 vs「项目名称」槽）不得判 high 防串值**；low→ask（禁止臆测）；**填入文字必须继承占位 run 的 rPr（下划线/字号/字体/底纹），跨 run 时构造带源 rPr 的新 run，保留原占位 run 长度，不重建文档**；(3)交付前跑机检（verify.py：占位残留/金额一致/结构保真/红线，红线按行判定+目录短行不算实质响应），缺失 --quotes/--template/--tender-parse 时对应轨道记 SKIP 显式披露，FAIL（exit 5）禁止交付；(4)叙述章节由 write_narrative.py 检索本地知识库生成素材并写入草稿（数字/参数须溯源）；(5)证照图片由 insert_images.py 从成交响应文件抽图按小节插入（标题锚点后居中图 6in）；(6)以既有参考输出为基准做逐节 diff 回归（diff_report.py），输出差异清单与通过率统计。区别于 bid-studio（全流程含决策/评分范式挂载），本 skill 专注「模板驱动撰写+量化回归」。
-version: 0.3.2
-agent_created: true
+description: 模板截取式投标文件撰写。用于按招标文件原格式编制投标/响应文件：原样截取 docx 模板，扫描槽位；由模型理解上下文并只读检索企业库、项目库和知识库，证据关卡仅放行唯一且可追溯的可信事实，歧义项交用户确认；原格式写回后执行占位、金额、结构、红线与 diff 校验。区别于 bid-studio，本 skill 专注模板驱动撰写和量化回归。
 metadata:
+  version: 0.4.0
+  agent_created: true
   compatible_agents: [workbuddy]
 ---
 
@@ -16,6 +16,7 @@ metadata:
 - `scripts/extract_template.py` — 环节一：起止定位 + **原样切片** → template.docx + template.json（元数据）
 - `scripts/parse_tender.py` — 节点0：招标结构解析 → tender.json（常量/评分项/废标红线/时间节点）+ 项目常量.json
 - `scripts/fill_plan.py` — 环节二：槽位扫描 + 置信度分级 + 提问单 / 汇总 fills.json
+- `scripts/smart_fill.py` — 环节二智能层：生成模型检索任务，验证模型决策的证据、唯一性与可自动填写资格
 - `scripts/kb_assist.py` — 环节二：知识库检索辅助（可选，为 ask 档槽位附 `kb_hint` 背景参考）
 - `scripts/fill_docx.py` — 环节二尾部：fills 就地写回切片副本（格式继承源文件，不重建文档）
 - `scripts/write_narrative.py` — 环节二续：叙述章节撰写（KB 检索素材 → 就地写入草稿 + 溯源 JSON）
@@ -25,6 +26,7 @@ metadata:
 - `scripts/_common.py` — 共享：金额解析（大写↔数字）、归一化、原子写、路径守卫
 - `references/template-schema.md` — 环节一实现逻辑与元数据契约
 - `references/confidence-protocol.md` — 环节二置信度判定与提问协议
+- `references/smart-fill-protocol.md` — 模型检索、数据源目录、决策 JSON、证据放行与审计协议；启用智能填空时必须读取
 - `references/diff-interface.md` — 环节四 diff 算法与报告格式
 - `references/redline-checklist.md` — 按采购类型的必备模板/要件清单
 
@@ -46,43 +48,51 @@ python scripts/extract_template.py <招标文件.docx> -o template.docx -m templ
 - `--require` 命中检查在切片范围内做（关键词出现在任一正文文本）；未命中 → 退出码 3 + MISS 清单 → **向用户确认**（替代模板？单独附件？）后才可继续。
 - `template.json` 元数据：起止标题、近似页码（780字/页估算）、章内标题清单 `headings`、表格数。`headings` 供环节四 C 轨道核对"模板节不许删"。
 
-- **实测直填经验（2026-09 淄博项目知识库直填）**：① 知识库根目录通常与 `企业画像_*.json` 同目录（本次 `C:\Users\yahe_\Desktop\AI标书撰写\知识库`），且检索服务进程可经 `Get-CimInstance Win32_Process`/`netstat` 反查工作目录；② **一朝发现库内存在本项目历史成交响应文件（`_docs/项目2_响应文件_雅合科技.md`+`_assets/tables/*.md`）即为最高置信度直填来源**：企业全要素、法人/代理人身份证、资质证号、报价、工期、业绩、人员班子、设备/仪器/劳动力/临时用地 6 张附表一应俱全，read+正则定位后 run 级直填 38 段+全 16 表即可；③ 工期/质量/报价等「用户暂定值」与知识库成交版冲突时，以库内实际成交版为准直填并在交付说明标注（本次 240→46 日历天、一次性验收合格→合格、报价 250988.59/234393.20 税率9%）；④ 投标函大写金额模板后缀冗余「元」（如「贰角元」系模板句尾「元」+替换遗留）须人工清洗；⑤ verify.py A 项需给模板原生格式标题（「投标函【工程量清单计价】」）加 EXEMPT 豁免，否则永远 FAIL——已修复进脚本；⑥ D 红线扫描措辞须与招标原文逐字对齐（「商务报价excel版」小写、含「的」），做到 20/20 全命中。
+- **实测检索经验（2026-09 淄博项目）**：① 知识库根目录通常与 `企业画像_*.json` 同目录，检索服务进程可经 `Get-CimInstance Win32_Process`/`netstat` 反查工作目录；② 历史成交响应文件适合帮助模型定位企业要素、人员、设备和附表，但在 v0.4.0 起归类为 `document`：只有把事实核验并固化进结构化企业库/当前项目库后才可自动填写，历史文档与当前口径冲突必须提问；③ 投标函大写金额模板后缀冗余「元」须人工清洗；④ verify.py A 项需给模板原生格式标题加 EXEMPT 豁免；⑤ D 红线扫描措辞须与招标原文逐字对齐。
 
-## 环节二：置信度分级填空
+## 环节二：模型检索 + 证据化填空
 
-**槽位 = 切片 docx 中的占位：段落空白槽（`____`、`【】`、`（ ）`、`致：· · ·（招标人名称）`式冒号空白）与表格占位单元格。三档处理：**
+启用智能填空时，先读 `references/smart-fill-protocol.md`。槽位仍由确定性脚本扫描；模型负责理解 `label + context`、选择只读数据源并检索，不能把语言概率或常识当成企业事实。
 
-| 置信度 | 判定 | 动作 |
+| 结果 | 判定 | 动作 |
 |---|---|---|
-| high | 画像键名与槽 label 归一化后【精确一致】且值唯一（含编号前缀如「（九）工期」）→ auto | 直接填入，不问 |
-| medium | 精确键多值冲突 / 仅子串（模糊）命中（如画像「名称」键 vs 槽「项目名称」） | **列出候选项+依据向用户确认后才写入**（子串命中不得降级 high，防串值） |
-| low | 无任何来源 | **必须提问**（含"自行填写"选项），禁止臆测 |
+| deterministic high | 画像键与槽位精确一致且值唯一 | 原机械路径自动填写 |
+| model high | 模型检索到唯一值；值逐字存在于证据；至少一条证据来自 `structured` / `tender` / `confirmed`；含可复查 locator | 经 `smart_fill.py validate` 后自动填写 |
+| medium | 多值冲突、仅模糊匹配、仅历史文档或知识库证据 | 列候选、来源和定位，用户确认后填写 |
+| low | 无来源、证据不完整或模型未返回决策 | 保留占位并提问，禁止臆测 |
 
 ```bash
-# 1) 扫描槽位并匹配资料（画像/项目资料 JSON，逗号分隔）
-python scripts/fill_plan.py scan template.docx --sources 企业画像.json -o fill_plan.json --questions questions.json
+# 1) 确定性扫描：发现槽位、登记 JSON 数据源、完成可证明的精确匹配
+python scripts/fill_plan.py scan template.docx --sources 企业画像.json,项目常量.json \
+  -o fill_plan.json --questions questions.json
 
-# 1.5) 【可选】知识库检索辅助：为 ask 档槽位附背景参考（服务不可达时静默跳过）
-python scripts/kb_assist.py fill_plan.json -o fill_plan_kb.json --service http://127.0.0.1:8765
+# 2) 生成模型任务。data_sources.json 可登记 SQLite、HTTP 检索服务或其他只读连接器
+python scripts/smart_fill.py prepare fill_plan.json --catalog data_sources.json \
+  -o model_tasks.json
 
-# 2) ★ 人机确认关口：逐条消费 questions.json——用 AskUserQuestion 工具分批提问
-#    （每次 ≤4 题；medium 列候选+依据，低置信度允许自填）。答案写 answers.json：
-#    {"answers": {"<slot_id>": "<用户确认值>"}}
-#    若执行过 1.5，把槽位的 kb_hint 作为提问的「背景参考」附在题干，帮助判断口径；
-#    kb_hint 仅供人判断，不作为候选值、不得绕过确认直接写入（W2 不变）。
+# 3) ★ 模型主动检索：逐项读取 model_tasks.json，调用当前环境可用的只读数据库/知识库工具；
+#    记录 canonical_field、实际 query、selected_value、reason 和 evidence，写 model_decisions.json。
+#    evidence 必含 value/source/source_type/locator；冲突值全部保留，不得自行消掉。
 
-# 3) 汇总可写值（仅 high/auto 与已确认槽位进 fills；未确认保持占位）
-python scripts/fill_plan.py apply template.docx fill_plan.json --answers answers.json -o fills.json
+# 4) 确定性证据关卡：只生成可自动写入值，其余生成待确认问题
+python scripts/smart_fill.py validate fill_plan.json model_decisions.json \
+  --catalog data_sources.json -o smart_fill.json --questions smart_questions.json
 
-# 4) 就地写回切片副本（run 级替换保格式；未填占位原样保留）
+# 5) 人工只处理 smart_questions.json；答案写 answers.json。
+#    合并优先级：human_answer > model_evidence > deterministic_auto
+python scripts/fill_plan.py apply template.docx fill_plan.json \
+  --smart smart_fill.json --answers answers.json -o fills.json
+
+# 6) 原格式写回；fills.json.audit 保留每个值的来源和模型检索证据
 python scripts/fill_docx.py template.docx fills.json -o 投标文件草稿_YYYYMMDD.docx
-
-# 5) 叙述性小节（技术方案/施工组织等模板要求自拟的章节）：优先用知识库检索佐证素材——
-#    通过检索服务 /query（context 格式）取出处可溯源的片段续写；数字/资质/业绩仍受 W2/W3 约束。
 ```
 
+- 结构化数据库、招标解析结果和已确认事实可成为 model high；证据来源必须登记且类型与数据源目录一致。向量知识库与历史文档只产生候选，不得单独触发自动填写。
+- 数据源只读。模型不得通过修改数据库、索引或来源文档来制造证据。
+- 金额、报价、日期、工期、证照、信用代码、银行账号、法定代表人等 critical fact 必须核对当前项目、主体和有效期；冲突即问。
+- 不具备数据库连接器时，保留原 `fill_plan.py scan → questions → apply` 路径；`kb_assist.py` 仍可作为只提供背景的降级方案。
 - **`fill_docx.py` 退出码 3（剩余占位）= 不可交付**，回到提问关口清零后重填。
-- 槽位 id 稳定格式：段落 `P{段号}#{第几个占位}`、表格 `T{表号}:R{行}C{列}`（0 起）。label 匹配是初筛，提问前 agent 必须复核语义相关性（泛匹配剔除）。
+- 槽位 id 稳定格式：段落 `P{段号}#{第几个占位}`、表格 `T{表号}:R{行}C{列}`（0 起）。
 
 ## 节点0：招标文件结构化解析（parse_tender.py）
 
@@ -151,7 +161,7 @@ python scripts/diff_report.py <参考基准.docx|json> <新结果.docx|json> \
 
 **服务状态**：仅监听 `127.0.0.1:8765`。启动：`知识库/_service/start_service.bat`（或 `python server.py`）。数据源为 `知识库/` 六大库的 Markdown/表格/JSON 索引，2089 个分块，向量模型 `BAAI/bge-small-zh-v1.5`。
 
-**agent 调用方式（两种，等价）**：
+**agent 调用方式**：
 
 1. 脚本通道（推荐，免 HTTP 细节）：`python scripts/kb_assist.py fill_plan.json -o fill_plan_kb.json`
    - 对每个 `status=ask` 槽位，用 `label + context` 拼检索句，取 top-2 片段的 `context_block`（截 300 字）写入 `slot.kb_hint`
@@ -175,7 +185,8 @@ python scripts/diff_report.py <参考基准.docx|json> <新结果.docx|json> \
 ```
 
 **使用纪律**：
-- `kb_hint` / 检索片段是**背景参考**，不是候选值：不得据此把槽位升为 high 或绕过提问（W2）。
+- 智能填空优先按 `references/smart-fill-protocol.md` 生成任务并记录结构化 evidence；`kb_assist.py` 是无数据库工具时的轻量降级方案。
+- `kb_hint` / 向量检索片段可成为模型的 medium 候选，但不是自动填写证据：不得单独升为 high 或绕过提问（W2）。
 - 续写叙述章节时，引用的数字/参数必须带 `source_path` 溯源；检索不到就写「待补充」并列入提问清单。
 - 服务健康检查：`GET /health`（返回 `chunks` 总数）；数据更新后执行 `知识库/_service` 的 `ingest.py` 增量导入。
 
@@ -192,7 +203,7 @@ python scripts/diff_report.py <参考基准.docx|json> <新结果.docx|json> \
 ## 铁规则
 
 - W1 模板唯一来源是招标文件；miss 必问，不得自造格式。
-- W2 low/medium 槽位未获用户确认不得写入；answers.json 是唯一写入凭据。
+- W2 写入来源只允许：机械精确匹配 high、经 `smart_fill.py validate` 放行的模型证据 high、或 `answers.json` 用户确认值；medium/low 未确认不得写入。
 - W3 金额、资质编号、日期只信画像与招标文件，冲突即问。
 - W4 verify FAIL 或 fill_docx 剩余占位 >0 → 禁止交付。
 - W5 回归差异不得静默忽略，每轮 diff 报告归档。
@@ -203,6 +214,7 @@ python scripts/diff_report.py <参考基准.docx|json> <新结果.docx|json> \
 
 ## Changelog
 
+- v0.4.0 (2026-09-04)：模型检索填空。新增 `smart_fill.py prepare/validate` 与 `references/smart-fill-protocol.md`：模型可理解槽位并主动查询只读企业库、项目库、招标解析结果和知识库；唯一且可定位的 `structured/tender/confirmed` 事实可自动填写，文档/向量库证据与冲突值自动降级提问。`fill_plan.py apply --smart` 合并模型结果并在 `fills.json.audit` 记录来源，优先级为人工 > 模型证据 > 机械 high。
 - v0.3.2 (2026-09-04)：下划线格式保真。`fill_docx._replace_in_para` 跨 run 路径不再粗暴置空旧 run 重建段落，改为把填入文字放在首 run（保留 rPr）+ post 段追加到新 run（同样带源 rPr）+ 其余占位 run 仅清空文字。彻底解决「填完下划线消失」「天」字重复/丢失等 review 痛点。新增 tests/test_underline.py 5 个用例（单 run / 跨 run 中段 / 跨 run 末段 / 文本长度不变 / 未命中返回 False）。pytest 38 passed。
 - v0.3.1 (2026-09-04)：质量加固。P1：fill_plan 置信度判定改为「精确键命中才 high」，子串命中（防「名称→项目名称」类串值）一律降 medium；verify.py 缺 `--quotes/--template/--tender-parse` 改 SKIP 显式披露（不静默绿灯），D 红线按行判定+目录短行不算实质响应；补全 scripts/insert_images.py（标题锚点后居中图 6in + PermissionError 另存 `_含图版.docx`）。P2：`_common.norm` 全角冒号统一（曾导致 label 不可比）；`cn_to_num` 修「壹佰贰拾叁元肆角伍分」被吞 0.45 元 bug；`parse_amount` 改先剥币种再判模糊修饰语；共享 `EXEMPT_PH`/`is_exempt_ph` 取代硬编码白名单。新增 tests/（pytest 33 个用例 + smoke_test/smoke_verify 端到端冒烟）。
 - v0.3.0 (2026-09-01)：四环节流水线定型；淄博项目实战踩坑记录；知识库直填 / 图片插入流程沉淀

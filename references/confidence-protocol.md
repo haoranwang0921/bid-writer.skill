@@ -28,7 +28,7 @@
 
 当前工作区实例：`AI标书撰写/企业画像_雅合科技.json`（**草稿态**：文本层可提取字段已填，证照编号/签章人等待扫描件核对，字段值里的「待确认」会自然落入 low 档提问）。
 
-## 置信度判定规则
+## 机械匹配置信度
 
 槽位 label 与源键 norm 后双向包含匹配（≥2 字）：
 
@@ -36,7 +36,17 @@
 - **medium**：2–4 个不同候选值 → `status=ask`，提问列出候选+依据来源；
 - **low**：零命中 → `status=ask`，选项为「自行填写」（agent 可给建议选项，但建议不落 answers 即不生效）。
 
-> **语义复核义务**：label 匹配是机械初筛，提问前 agent 必须剔除形似而实非的命中（如"地址"槽泛匹配到业绩地址）、把"多套合理口径"（含税/不含税、大写/小写栏）升为 medium。**脚本保证不漏，人保证不错。**
+> label 匹配只是无需模型的第一层。形似而实非、多套合理口径以及无命中槽位交给模型检索层处理；未启用智能填空时仍须人工复核。
+
+## 模型检索置信度
+
+启用模型检索时，完整流程与 JSON 契约见 [smart-fill-protocol.md](smart-fill-protocol.md)。模型读取槽位的 label、所在句/表头和上下文，自主选择只读数据源、执行查询并提交带 locator 的证据。
+
+- **model high**：唯一证据值，且至少一条证据来自 `structured`、`tender` 或 `confirmed`；经 `smart_fill.py validate` 后可自动填写。
+- **medium**：多值冲突、仅 `document` / `knowledge_base` 命中、或模型主动表达不确定；必须确认。
+- **low**：无事实、证据缺字段、selected value 不在证据中或模型漏答；必须确认。
+
+模型声明 high 不等于自动放行。`smart_fill.py validate` 是强制关卡，模型输出不能直接作为 `fill_docx.py` 输入。
 
 ## 提问协议（AskUserQuestion 映射）
 
@@ -44,7 +54,7 @@ questions.json 每条 → AskUserQuestion 一题：
 - `question`：`「{context 所在小节}」中的「{label}」如何填写？`
 - `options`：candidates 前 3 项（label=值，description=依据来源）；low 题靠系统 Other 自填
 - 每批 ≤4 题；全部答复汇总进 answers.json 后才执行 apply。
-- **W2**：answers.json 是唯一写入凭据；未答槽位在成稿中保持原占位，交付前必须清零。
+- **W2**：medium/low 仍以 `answers.json` 为唯一确认凭据；model high 只有进入经验证的 `smart_fill.json.auto_fills` 后才可写入。未决槽位在成稿中保持原占位，交付前必须清零。
 
 ## 接口契约
 
@@ -56,13 +66,17 @@ questions.json 每条 → AskUserQuestion 一题：
 {"questions":[{"id","label","current","context","confidence","options":[…],"basis"}]}
 // answers.json（用户确认后 agent 整理）
 {"answers": {"P148#0": "青岛雅合科技发展有限公司", "T3:R1C2": "2026-09-01"}}
+// smart_fill.json（模型决策经证据关卡后的产物）
+{"meta":{"protocol":"bid-writer-smart-fill/v1","validated":true},
+ "auto_fills":{"P149#0":"张三"}, "decisions":[…], "questions":[…]}
 // fills.json（apply 输出）
-{"fills": {"<slot_id>": "<值>"}, "unconfirmed": 7}
+{"fills": {"<slot_id>": "<值>"},
+ "audit":{"<slot_id>":{"origin":"model_evidence","evidence":[…]}}, "unconfirmed": 7}
 ```
 
 ## kb_assist.py（环节二可选增强，本地知识库检索）
 
-**作用**：对 `status=ask` 的槽位（medium/low），调用本地检索服务（`127.0.0.1:8765`）获取参考知识片段，写入槽位的 `kb_hint` 字段，供提问关口展示给用户作为判断依据。
+**作用**：未启用模型检索流程时，对 `status=ask` 的槽位调用本地检索服务获取参考片段，写入 `kb_hint` 供提问使用。智能模式下优先使用 `smart_fill.py`，让模型自行设计查询并提交结构化 evidence。
 
 **用法**：
 ```bash
@@ -79,9 +93,9 @@ python scripts/kb_assist.py fill_plan.json -o fill_plan_kb.json
 ```
 
 **使用纪律**（与 W2 一致）：
-- `kb_hint` 是**背景参考**，帮助判断口径，不作为候选值、不绕过确认；
+- `kb_hint` 是**背景参考**，帮助判断口径，不作为自动填写证据、不绕过确认；
 - medium 槽位：`kb_hint` 解释候选值来源背景（如"填包料配方：石膏粉75%/硫酸钠5%/膨润土20%"）；
-- low 槽位：`kb_hint` 提供填写方向，最终值仍须用户确认写入 `answers.json`；
+- low 槽位：`kb_hint` 提供填写方向，最终值仍须用户确认写入 `answers.json`；模型智能模式可以把检索片段整理成 medium 候选，但不能仅凭知识库证据自动填写；
 - `meta.kb_assist.status`：`done`（检索完成）/ `skipped`（服务不可达）。
 
 ## fill_docx.py（就地写回）
